@@ -4,7 +4,7 @@
  * A trade signal only fires when at least CONFIRM_THRESHOLD (8 of 10) indicators
  * agree on the same direction — high conviction, fewer trades by design.
  */
-const CONFIRM_THRESHOLD = 8;
+const CONFIRM_THRESHOLD = 6;
 const TOTAL_INDICATORS = 10;
 
 function generateSignal(ind) {
