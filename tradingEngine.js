@@ -19,17 +19,45 @@ class TradingEngine {
       indicators: null,
       signalInfo: null,
       position: null, // { side, size, entryPrice, stopLoss, takeProfit }
+      unrealizedPnlUsd: null,
+      unrealizedPnlPercent: null,
       balanceUsd: null,
       startOfDayBalance: null,
+      sessionPnlUsd: null,
+      sessionPnlPercent: null,
+      realizedPnlUsd: 0,
+      wins: 0,
+      losses: 0,
+      totalClosedTrades: 0,
       autoTradeEnabled: config.autoTradeEnabled,
       dryRun: config.dryRun,
       tradingHalted: false,
       haltReason: null,
       recentTrades: [],
+      priceHistory: [], // [{ time, price }] — rolling window for the live chart
       lastError: null,
     };
 
     this._productCache = null;
+    this._balanceBeforeClose = null; // used to estimate realized PnL on live position closes
+  }
+
+  /** Unrealized $ / % PnL for the current open position at a given mark price. */
+  _calcUnrealizedPnl(position, currentPrice, contractValue) {
+    if (!position || currentPrice == null) return { usd: null, percent: null };
+    const dir = position.side === 'buy' ? 1 : -1;
+    const priceDiff = (currentPrice - position.entryPrice) * dir;
+    const usd = priceDiff * position.size * contractValue;
+    const notional = position.entryPrice * position.size * contractValue;
+    const percent = notional ? (usd / notional) * 100 : null;
+    return { usd, percent };
+  }
+
+  _pushPriceHistory(time, price) {
+    this.state.priceHistory.push({ time, price });
+    if (this.state.priceHistory.length > 300) {
+      this.state.priceHistory = this.state.priceHistory.slice(-300);
+    }
   }
 
   async _getProduct() {
@@ -117,6 +145,52 @@ class TradingEngine {
     this.state.recentTrades = this.state.recentTrades.slice(0, 20);
   }
 
+  _recordClosedTrade({ side, size, entryPrice, exitPrice, pnlUsd, reason, dryRun }) {
+    this.state.realizedPnlUsd = +(this.state.realizedPnlUsd + pnlUsd).toFixed(2);
+    this.state.totalClosedTrades += 1;
+    if (pnlUsd >= 0) this.state.wins += 1;
+    else this.state.losses += 1;
+
+    this.state.recentTrades.unshift({
+      type: 'exit',
+      side,
+      size,
+      entryPrice,
+      exitPrice,
+      pnlUsd: +pnlUsd.toFixed(2),
+      reason,
+      dryRun,
+      time: new Date().toISOString(),
+    });
+    this.state.recentTrades = this.state.recentTrades.slice(0, 20);
+  }
+
+  /** Dry-run only: locally simulated positions don't live on the exchange, so
+   * the engine has to watch price vs. SL/TP itself and "close" the trade. */
+  _checkAndCloseDryRunPosition(currentPrice, contractValue) {
+    const pos = this.state.position;
+    if (!pos || !pos.simulated || currentPrice == null) return;
+
+    const hitTp = pos.side === 'buy' ? currentPrice >= pos.takeProfit : currentPrice <= pos.takeProfit;
+    const hitSl = pos.side === 'buy' ? currentPrice <= pos.stopLoss : currentPrice >= pos.stopLoss;
+    if (!hitTp && !hitSl) return;
+
+    const exitPrice = hitTp ? pos.takeProfit : pos.stopLoss;
+    const { usd: pnlUsd } = this._calcUnrealizedPnl(pos, exitPrice, contractValue);
+
+    this.state.balanceUsd = +(this.state.balanceUsd + pnlUsd).toFixed(2);
+    this._recordClosedTrade({
+      side: pos.side,
+      size: pos.size,
+      entryPrice: pos.entryPrice,
+      exitPrice,
+      pnlUsd,
+      reason: hitTp ? 'take-profit hit' : 'stop-loss hit',
+      dryRun: true,
+    });
+    this.state.position = null;
+  }
+
   async tick() {
     try {
       const product = await this._getProduct();
@@ -128,6 +202,14 @@ class TradingEngine {
 
       const ind = computeIndicators(candles);
       const signalInfo = generateSignal(ind);
+      const contractValue = product.contract_value ? +product.contract_value : 1;
+
+      const hadPositionBeforeRefresh = this.state.position;
+      const balanceBeforeThisTick = this.state.balanceUsd;
+
+      // Dry-run positions live only in memory — check SL/TP against the latest
+      // price ourselves and realize the P&L before anything else this tick.
+      this._checkAndCloseDryRunPosition(ind.price, contractValue);
 
       const balance = await this._refreshBalance();
       if (this.state.startOfDayBalance == null) this.state.startOfDayBalance = balance;
@@ -142,11 +224,38 @@ class TradingEngine {
 
       const position = await this._refreshPosition(product.id);
 
+      // Live mode: if a position we had last tick is gone now, the exchange
+      // closed it (SL/TP or manual). We don't get an exit fill here, so the
+      // realized P&L is estimated from the balance delta since last tick.
+      if (!this.config.dryRun && hadPositionBeforeRefresh && !position && balanceBeforeThisTick != null) {
+        const pnlUsd = +(balance - balanceBeforeThisTick).toFixed(2);
+        this._recordClosedTrade({
+          side: hadPositionBeforeRefresh.side,
+          size: hadPositionBeforeRefresh.size,
+          entryPrice: hadPositionBeforeRefresh.entryPrice,
+          exitPrice: ind.price,
+          pnlUsd,
+          reason: 'position closed on exchange (estimated P&L)',
+          dryRun: false,
+        });
+      }
+
+      // Unrealized P&L on whatever's open right now
+      const unrealized = this._calcUnrealizedPnl(this.state.position, ind.price, contractValue);
+      this.state.unrealizedPnlUsd = unrealized.usd != null ? +unrealized.usd.toFixed(2) : null;
+      this.state.unrealizedPnlPercent = unrealized.percent != null ? +unrealized.percent.toFixed(2) : null;
+
+      if (this.state.startOfDayBalance) {
+        this.state.sessionPnlUsd = +(balance - this.state.startOfDayBalance).toFixed(2);
+        this.state.sessionPnlPercent = +(((balance - this.state.startOfDayBalance) / this.state.startOfDayBalance) * 100).toFixed(2);
+      }
+
       this.state.price = ind.price;
       this.state.indicators = ind;
       this.state.signalInfo = signalInfo;
       this.state.lastUpdated = new Date().toISOString();
       this.state.lastError = null;
+      this._pushPriceHistory(this.state.lastUpdated, ind.price);
 
       const canTrade =
         this.config.autoTradeEnabled &&
@@ -169,7 +278,7 @@ class TradingEngine {
           riskPercent: this.config.riskPercent,
           leverage: this.config.leverage,
           price: ind.price,
-          contractValue: product.contract_value ? +product.contract_value : 1,
+          contractValue,
         });
 
         const result = await this._placeEntryOrder({ side, size, product, stopLoss, takeProfit });
@@ -179,6 +288,7 @@ class TradingEngine {
         }
 
         this._recordTrade({
+          type: 'entry',
           side,
           size,
           entryPrice: ind.price,
@@ -211,3 +321,4 @@ class TradingEngine {
 }
 
 module.exports = { TradingEngine };
+        
